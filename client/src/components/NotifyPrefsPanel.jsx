@@ -13,6 +13,9 @@ function NotifyPrefsPanel({ prefs, onSave }) {
   const [saved, setSaved] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState(null); // null | { discord, email }
+  const [status, setStatus] = useState(null); // null | API response
+  const [statusLoading, setStatusLoading] = useState(false);
+  const [statusError, setStatusError] = useState(null);
   const [pollOptions, setPollOptions] = useState([
     { label: "30 seconds", value: 30_000 },
     { label: "1 minute",   value: 60_000 },
@@ -77,6 +80,25 @@ function NotifyPrefsPanel({ prefs, onSave }) {
       setTestResult({ error: err.message });
     } finally {
       setTesting(false);
+    }
+  }
+
+  async function handleRefreshStatus() {
+    setStatusLoading(true);
+    setStatusError(null);
+    try {
+      const user = auth.currentUser;
+      if (!user) throw new Error("Not logged in");
+      const token = await user.getIdToken();
+      const res = await fetch(`${API_BASE}/api/notify/status`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setStatus(await res.json());
+    } catch (err) {
+      setStatusError(err.message);
+    } finally {
+      setStatusLoading(false);
     }
   }
 
@@ -200,6 +222,60 @@ function NotifyPrefsPanel({ prefs, onSave }) {
           <span className="field-hint">
             How often the server checks for open slots on your watched courses.
           </span>
+        </div>
+
+        {/* ── Poller diagnostics ── */}
+        <div className="notify-diagnostics">
+          <div className="notify-diagnostics-header">
+            <span className="notify-label">Poller diagnostics</span>
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={handleRefreshStatus}
+              disabled={statusLoading}
+            >
+              {statusLoading ? "Loading…" : "🔄 Refresh status"}
+            </button>
+          </div>
+          {statusError && (
+            <p className="notify-info" style={{ color: "#ef4444" }}>✗ {statusError}</p>
+          )}
+          {status && !statusError && (
+            <>
+              <p className="notify-desc" style={{ marginBottom: 8 }}>
+                Poller ready: <strong>{status.pollerReady ? "✔ Yes" : "⧗ Seeding…"}</strong>
+                {status.lastPolled && <> · Last polled: <strong>{new Date(status.lastPolled).toLocaleTimeString()}</strong></>}
+              </p>
+              {status.watching.map((w) => {
+                const n = w.ntust;
+                const healthy = n && n.consecutiveFailures === 0 && n.lastSuccessAt;
+                const failing = n && n.consecutiveFailures > 0;
+                return (
+                  <div key={w.courseNo} className="notify-course-stat">
+                    <div className="notify-course-stat-title">
+                      <span
+                        className="notify-course-stat-dot"
+                        style={{
+                          background: !n ? "#6b7280" : healthy ? "#22c55e" : failing ? "#ef4444" : "#f59e0b",
+                        }}
+                      />
+                      <strong>{w.courseNo}</strong>{w.courseName ? ` — ${w.courseName}` : ""}
+                    </div>
+                    {n ? (
+                      <ul className="notify-course-stat-list">
+                        <li>NTUST fetches: {n.totalFetches} total, {n.consecutiveFailures} consecutive failure{n.consecutiveFailures !== 1 ? "s" : ""}</li>
+                        {n.lastSuccessAt && <li>Last success: {new Date(n.lastSuccessAt).toLocaleTimeString()}</li>}
+                        {n.lastErrorAt && <li style={{ color: "#ef4444" }}>Last error: {n.lastError} ({new Date(n.lastErrorAt).toLocaleTimeString()})</li>}
+                        {w.cache && <li>Cached enrollment: {w.cache.chooseStudent} / {w.cache.restrict1} ({w.cache.ageSeconds}s ago)</li>}
+                        {w.state && <li>Poller state: {w.state.wasFull ? "Full" : "Open"}{w.state.notifiedOpen ? " · notified" : ""}</li>}
+                      </ul>
+                    ) : (
+                      <p className="notify-desc">No fetch data yet — poller hasn’t run for this course.</p>
+                    )}
+                  </div>
+                );
+              })}
+            </>
+          )}
         </div>
       </div>
 

@@ -157,6 +157,7 @@ app.get("/api/notify/status", generalLimiter, requireAuth, (req, res) => {
     const state = stateMap.get(stateKey) ?? null;
     const cacheKey = `${w.Semester ?? ""}::${w.CourseNo}`;
     const cached = courseCache.get(cacheKey);
+    const stats = fetchStats.get(cacheKey) ?? null;
     watching.push({
       courseNo: w.CourseNo,
       courseName: w.CourseName ?? "",
@@ -170,6 +171,19 @@ app.get("/api/notify/status", generalLimiter, requireAuth, (req, res) => {
             ageSeconds: Math.round((now - cached.fetchedAt) / 1000),
             chooseStudent: cached.course.ChooseStudent,
             restrict1: cached.course.Restrict1,
+          }
+        : null,
+      ntust: stats
+        ? {
+            lastSuccessAt: stats.lastSuccessAt
+              ? new Date(stats.lastSuccessAt).toISOString()
+              : null,
+            lastErrorAt: stats.lastErrorAt
+              ? new Date(stats.lastErrorAt).toISOString()
+              : null,
+            lastError: stats.lastError ?? null,
+            consecutiveFailures: stats.consecutiveFailures,
+            totalFetches: stats.totalFetches,
           }
         : null,
     });
@@ -449,6 +463,9 @@ const userLastPolled = new Map(); // uid → Date.now() timestamp
 // Cache the last NTUST result per course key to avoid redundant fetches.
 // key: `semester::courseNo` → { course: object, fetchedAt: number }
 const courseCache = new Map();
+// NTUST fetch health tracking.
+// key: `semester::courseNo` → { lastSuccessAt, lastErrorAt, lastError, consecutiveFailures, totalFetches }
+const fetchStats = new Map();
 let isFirstNotifyRun = true;
 let pollRunning = false; // prevents concurrent poll executions
 
@@ -599,11 +616,37 @@ async function pollNotifications() {
           const courses = Array.isArray(res.data) ? res.data : [];
           course = courses.find((c) => c.CourseNo === entry.CourseNo) ?? null;
           if (course) courseCache.set(key, { course, fetchedAt: now });
+          // Record success
+          const prev = fetchStats.get(key) ?? {
+            totalFetches: 0,
+            consecutiveFailures: 0,
+          };
+          fetchStats.set(key, {
+            ...prev,
+            lastSuccessAt: now,
+            lastError: null,
+            lastErrorAt: prev.lastErrorAt ?? null,
+            consecutiveFailures: 0,
+            totalFetches: prev.totalFetches + 1,
+          });
         } catch (err) {
           console.error(
             `[NOTIFY] Failed to fetch ${entry.CourseNo}:`,
             err.message,
           );
+          // Record failure
+          const prev = fetchStats.get(key) ?? {
+            totalFetches: 0,
+            consecutiveFailures: 0,
+          };
+          fetchStats.set(key, {
+            ...prev,
+            lastError: err.message,
+            lastErrorAt: now,
+            lastSuccessAt: prev.lastSuccessAt ?? null,
+            consecutiveFailures: (prev.consecutiveFailures ?? 0) + 1,
+            totalFetches: prev.totalFetches + 1,
+          });
           // Fall back to stale cache so we don't lose the course reference,
           // but mark it stale so we don't make state-transition decisions on
           // potentially outdated enrollment data.
