@@ -241,12 +241,34 @@ function NotifyPrefsPanel({ prefs, onSave }) {
           )}
           {status && !statusError && (
             <>
-              <p className="notify-desc" style={{ marginBottom: 8 }}>
-                Poller ready: <strong>{status.pollerReady ? "✔ Yes" : "⧗ Seeding…"}</strong>
-                {status.lastPolled && <> · Last polled: <strong>{new Date(status.lastPolled).toLocaleTimeString()}</strong></>}
-              </p>
+              {/* Global poller health */}
+              <div className="notify-course-stat">
+                <ul className="notify-course-stat-list" style={{ paddingLeft: 0, listStyle: "none" }}>
+                  <li>Poller ready: <strong>{status.pollerReady ? "✔ Yes" : "⧗ Seeding…"}</strong></li>
+                  {status.hasAnyNotify != null && (
+                    <li>
+                      Notification channels:{" "}
+                      <strong>{status.hasAnyNotify ? "✔ configured" : "✗ none enabled"}</strong>
+                      {!status.hasAnyNotify && <span style={{ color: "#f59e0b" }}> — enable email or Discord above</span>}
+                    </li>
+                  )}
+                  {status.requestedIntervalMs != null && status.effectiveIntervalMs != null && (
+                    <li>
+                      Poll interval: requested <strong>{(status.requestedIntervalMs / 1000).toFixed(0)}s</strong>
+                      {" → "}effective <strong>{(status.effectiveIntervalMs / 1000).toFixed(0)}s</strong>
+                      {status.requestedIntervalMs !== status.effectiveIntervalMs && (
+                        <span style={{ color: "#f59e0b" }}> (capped — not an auth user)</span>
+                      )}
+                    </li>
+                  )}
+                  {status.lastPolled && (
+                    <li>Last polled: <strong>{new Date(status.lastPolled).toLocaleTimeString()}</strong></li>
+                  )}
+                </ul>
+              </div>
               {status.watching.map((w) => {
                 const n = w.ntust;
+                const skipped = w.skipReasons && w.skipReasons.length > 0;
                 const healthy = n && n.consecutiveFailures === 0 && n.lastSuccessAt;
                 const failing = n && n.consecutiveFailures > 0;
                 return (
@@ -255,12 +277,18 @@ function NotifyPrefsPanel({ prefs, onSave }) {
                       <span
                         className="notify-course-stat-dot"
                         style={{
-                          background: !n ? "#6b7280" : healthy ? "#22c55e" : failing ? "#ef4444" : "#f59e0b",
+                          background: skipped ? "#f59e0b" : !n ? "#6b7280" : healthy ? "#22c55e" : failing ? "#ef4444" : "#f59e0b",
                         }}
                       />
                       <strong>{w.courseNo}</strong>{w.courseName ? ` — ${w.courseName}` : ""}
                     </div>
-                    {n ? (
+                    {skipped ? (
+                      <ul className="notify-course-stat-list">
+                        {w.skipReasons.map((r) => (
+                          <li key={r} style={{ color: "#f59e0b" }}>⚠ Skipped: {r}</li>
+                        ))}
+                      </ul>
+                    ) : n ? (
                       <ul className="notify-course-stat-list">
                         <li>NTUST fetches: {n.totalFetches} total, {n.consecutiveFailures} consecutive failure{n.consecutiveFailures !== 1 ? "s" : ""}</li>
                         {n.lastSuccessAt && <li>Last success: {new Date(n.lastSuccessAt).toLocaleTimeString()}</li>}

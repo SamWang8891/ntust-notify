@@ -145,52 +145,79 @@ app.get("/health", generalLimiter, (_req, res) => {
  */
 app.get("/api/notify/status", generalLimiter, requireAuth, (req, res) => {
   const uid = req.user.uid;
-  const courses = watchedCoursesData.get(uid);
-  if (!courses || courses.size === 0) {
-    return res.json({ watching: [], pollerReady: !isFirstNotifyRun });
-  }
+  const userData = usersData.get(uid);
+  const notifyPrefs = userData?.notifyPrefs ?? {};
+  const userEmail = userData?.email ?? req.user.email ?? "";
 
+  const isAuthUser =
+    AUTH_EMAILS.length > 0 && AUTH_EMAILS.includes(userEmail.toLowerCase());
+  const requestedInterval = notifyPrefs.pollInterval ?? 60_000;
+  const effectiveInterval = Math.max(
+    requestedInterval,
+    isAuthUser ? 1_000 : 30_000,
+  );
+  const hasAnyNotify = !!(notifyPrefs.email || notifyPrefs.discord);
+
+  const courses = watchedCoursesData.get(uid);
   const now = Date.now();
   const watching = [];
-  for (const [, w] of courses) {
-    const stateKey = `${uid}::${w.CourseNo}`;
-    const state = stateMap.get(stateKey) ?? null;
-    const cacheKey = `${w.Semester ?? ""}::${w.CourseNo}`;
-    const cached = courseCache.get(cacheKey);
-    const stats = fetchStats.get(cacheKey) ?? null;
-    watching.push({
-      courseNo: w.CourseNo,
-      courseName: w.CourseName ?? "",
-      notifyEnabled: w.notifyEnabled ?? false,
-      state: state
-        ? { wasFull: state.wasFull, notifiedOpen: state.notifiedOpen }
-        : null,
-      cache: cached
-        ? {
-            ageMs: now - cached.fetchedAt,
-            ageSeconds: Math.round((now - cached.fetchedAt) / 1000),
-            chooseStudent: cached.course.ChooseStudent,
-            restrict1: cached.course.Restrict1,
-          }
-        : null,
-      ntust: stats
-        ? {
-            lastSuccessAt: stats.lastSuccessAt
-              ? new Date(stats.lastSuccessAt).toISOString()
-              : null,
-            lastErrorAt: stats.lastErrorAt
-              ? new Date(stats.lastErrorAt).toISOString()
-              : null,
-            lastError: stats.lastError ?? null,
-            consecutiveFailures: stats.consecutiveFailures,
-            totalFetches: stats.totalFetches,
-          }
-        : null,
-    });
+
+  if (courses) {
+    for (const [, w] of courses) {
+      const stateKey = `${uid}::${w.CourseNo}`;
+      const state = stateMap.get(stateKey) ?? null;
+      const cacheKey = `${w.Semester ?? ""}::${w.CourseNo}`;
+      const cached = courseCache.get(cacheKey);
+      const stats = fetchStats.get(cacheKey) ?? null;
+
+      // Explain why the poller might be skipping this course
+      const skipReasons = [];
+      if (!hasAnyNotify)
+        skipReasons.push(
+          "no notification channel enabled (email/discord both off)",
+        );
+      if (!w.notifyEnabled)
+        skipReasons.push("bell not enabled for this course");
+
+      watching.push({
+        courseNo: w.CourseNo,
+        courseName: w.CourseName ?? "",
+        notifyEnabled: w.notifyEnabled ?? false,
+        skipReasons,
+        state: state
+          ? { wasFull: state.wasFull, notifiedOpen: state.notifiedOpen }
+          : null,
+        cache: cached
+          ? {
+              ageMs: now - cached.fetchedAt,
+              ageSeconds: Math.round((now - cached.fetchedAt) / 1000),
+              chooseStudent: cached.course.ChooseStudent,
+              restrict1: cached.course.Restrict1,
+            }
+          : null,
+        ntust: stats
+          ? {
+              lastSuccessAt: stats.lastSuccessAt
+                ? new Date(stats.lastSuccessAt).toISOString()
+                : null,
+              lastErrorAt: stats.lastErrorAt
+                ? new Date(stats.lastErrorAt).toISOString()
+                : null,
+              lastError: stats.lastError ?? null,
+              consecutiveFailures: stats.consecutiveFailures,
+              totalFetches: stats.totalFetches,
+            }
+          : null,
+      });
+    }
   }
 
   res.json({
     pollerReady: !isFirstNotifyRun,
+    hasAnyNotify,
+    isAuthUser,
+    requestedIntervalMs: requestedInterval,
+    effectiveIntervalMs: effectiveInterval,
     lastPolled: userLastPolled.has(uid)
       ? new Date(userLastPolled.get(uid)).toISOString()
       : null,
