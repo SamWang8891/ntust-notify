@@ -11,20 +11,39 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 /**
- * Upstream NTUST course query endpoint used for both direct course searches and
- * background availability polling.
+ * Upstream NTUST course query API endpoint.
+ *
+ * This endpoint is used in two different flows:
+ * 1. Direct course search requests from the frontend.
+ * 2. Background polling that checks whether watched courses have open seats.
+ *
+ * @type {string}
  */
 const NTUST_API = "https://querycourse.ntust.edu.tw/QueryCourse/api/courses";
 
 // ─── Auth emails & poll intervals ────────────────────────────────────────────
 // AUTH_EMAILS: comma-separated list of email addresses that may poll as fast as
 // 1 s. All other users are capped at a 30 s minimum.
+
+/**
+ * List of privileged email addresses that are allowed to use a faster polling
+ * interval than normal users.
+ *
+ * The value is read from AUTH_EMAILS in the environment, split by commas, and
+ * normalized to lowercase so email comparisons are case-insensitive.
+ *
+ * @type {string[]}
+ */
 const AUTH_EMAILS = process.env.AUTH_EMAILS
   ? process.env.AUTH_EMAILS.split(",").map((e) => e.trim().toLowerCase())
   : [];
 
 /**
- * Poll intervals exposed to regular users.
+ * Poll interval choices available to regular users.
+ *
+ * Each item contains a human-readable label for the UI and the interval value
+ * in milliseconds that the backend uses when deciding whether a user should be
+ * polled again.
  *
  * @type {{label: string, value: number}[]}
  */
@@ -37,8 +56,10 @@ const NORMAL_POLL_OPTIONS = [
 ];
 
 /**
- * Poll intervals exposed to privileged users. These users may select the extra
- * 1-second polling option in addition to the normal set.
+ * Poll interval choices available to privileged users.
+ *
+ * These users get access to an additional 1-second option, while still keeping
+ * all regular polling options.
  *
  * @type {{label: string, value: number}[]}
  */
@@ -51,7 +72,18 @@ const AUTH_POLL_OPTIONS = [
 // Provide credentials via GOOGLE_APPLICATION_CREDENTIALS env var (path to
 // service-account JSON) or by setting FIREBASE_SERVICE_ACCOUNT_JSON to the
 // JSON string directly.
+
+/**
+ * Firestore database instance used by the backend.
+ *
+ * This remains null when Firebase Admin is not configured correctly. In that
+ * case, the server still starts, but notification polling and auth-dependent
+ * Firestore-backed features are effectively disabled.
+ *
+ * @type {import("firebase-admin/firestore").Firestore | null}
+ */
 let db = null;
+
 try {
   let credential;
   if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
@@ -74,7 +106,17 @@ try {
 
 // ─── Email transport ─────────────────────────────────────────────────────────
 // Configure SMTP via .env (e.g. Gmail App Password or any SMTP relay).
+
+/**
+ * Nodemailer transport used to send email notifications.
+ *
+ * This stays null if SMTP credentials are missing, which means email alerts are
+ * silently skipped while the rest of the app continues to work.
+ *
+ * @type {import("nodemailer").Transporter | null}
+ */
 let mailer = null;
+
 if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
   mailer = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
@@ -90,6 +132,15 @@ if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 // Allowed origins: ALLOWED_ORIGINS env var (comma-separated) merged with the
 // default production frontends.
+
+/**
+ * Browser origins that are allowed to call this backend.
+ *
+ * The list is built from ALLOWED_ORIGINS if provided; otherwise, it falls back
+ * to the known production frontend origins.
+ *
+ * @type {string[]}
+ */
 const ALLOWED_ORIGINS = [
   ...(process.env.ALLOWED_ORIGINS
     ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
@@ -99,12 +150,14 @@ const ALLOWED_ORIGINS = [
 app.use(
   cors({
     /**
-     * Validates whether an incoming browser origin may access the API.
-     * Requests without an Origin header (for example curl or server-to-server
-     * traffic) are allowed.
+     * Validates whether an incoming request origin is allowed by the CORS
+     * policy.
      *
-     * @param {string | undefined} origin - Incoming request origin.
-     * @param {(err: Error | null, allow?: boolean) => void} callback - CORS callback.
+     * Requests without an Origin header are allowed so tools such as curl,
+     * Postman, or server-to-server callers can still use the API.
+     *
+     * @param {string | undefined} origin - The Origin request header value.
+     * @param {(err: Error | null, allow?: boolean) => void} callback - Callback used by the cors middleware.
      * @returns {void}
      */
     origin(origin, callback) {
@@ -126,7 +179,13 @@ app.use(helmet());
 app.use(express.json({ limit: "16kb" }));
 
 // ─── Rate limiting ────────────────────────────────────────────────────────────
-// Course proxy: max 30 requests per minute per IP.
+
+/**
+ * Rate limiter for the /api/courses proxy route.
+ *
+ * This route fans out to the upstream NTUST API, so it uses a stricter limit to
+ * reduce abuse and protect the remote service.
+ */
 const courseLimiter = rateLimit({
   windowMs: 60_000,
   max: 30,
@@ -135,7 +194,10 @@ const courseLimiter = rateLimit({
   message: { error: "Too many requests, please slow down." },
 });
 
-// Poll options / general: max 60 requests per minute per IP.
+/**
+ * General-purpose rate limiter for lighter routes such as health checks,
+ * polling option lookup, and notification test/status endpoints.
+ */
 const generalLimiter = rateLimit({
   windowMs: 60_000,
   max: 60,
@@ -146,12 +208,14 @@ const generalLimiter = rateLimit({
 
 // ─── Auth middleware ──────────────────────────────────────────────────────────
 /**
- * Verifies the Firebase ID token attached to the Authorization header and
- * stores the decoded user payload on req.user.
+ * Verifies the Firebase ID token supplied in the Authorization header.
+ *
+ * On success, the decoded Firebase token payload is attached to req.user so
+ * downstream route handlers can access the authenticated user's UID and email.
  *
  * @param {import("express").Request} req - Express request object.
  * @param {import("express").Response} res - Express response object.
- * @param {import("express").NextFunction} next - Express next callback.
+ * @param {import("express").NextFunction} next - Express continuation callback.
  * @returns {Promise<void>}
  */
 async function requireAuth(req, res, next) {
@@ -168,7 +232,15 @@ async function requireAuth(req, res, next) {
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 /**
- * Lightweight health endpoint used by deployments and uptime checks.
+ * GET /health
+ *
+ * Minimal health-check route used by deployments, uptime monitors, reverse
+ * proxies, and humans who want a quick confirmation that the API process is
+ * alive.
+ *
+ * @param {import("express").Request} _req - Express request object.
+ * @param {import("express").Response} res - Express response object.
+ * @returns {void}
  */
 app.get("/health", generalLimiter, (_req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
@@ -176,12 +248,19 @@ app.get("/health", generalLimiter, (_req, res) => {
 
 /**
  * GET /api/notify/status
- * Authorization: Bearer <firebase-id-token>
  *
- * Returns the current in-memory polling state for the requesting user's watched
- * courses, including whether each course is currently considered full/open,
- * whether the open-state notification has already been sent, and the current
- * NTUST cache health.
+ * Returns a detailed snapshot of the backend's in-memory notification state for
+ * the authenticated user.
+ *
+ * The response includes:
+ * - Whether the poller has completed its first initialization run.
+ * - Whether the user currently has any notification channel enabled.
+ * - The requested and effective polling interval.
+ * - Per-course state such as cached NTUST data and recent fetch health.
+ *
+ * @param {import("express").Request & { user: { uid: string, email?: string } }} req - Authenticated request.
+ * @param {import("express").Response} res - Express response object.
+ * @returns {void}
  */
 app.get("/api/notify/status", generalLimiter, requireAuth, (req, res) => {
   const uid = req.user.uid;
@@ -267,11 +346,16 @@ app.get("/api/notify/status", generalLimiter, requireAuth, (req, res) => {
 
 /**
  * POST /api/notify/test
- * Authorization: Bearer <firebase-id-token>
  *
- * Sends immediate test notifications through the configured Discord webhook and
- * email channel so the user can verify both integrations without waiting for a
- * real course state change.
+ * Sends a fake notification immediately using the authenticated user's current
+ * notification preferences.
+ *
+ * This is intended for setup validation only and does not modify notification
+ * state or watched course state.
+ *
+ * @param {import("express").Request & { user: { uid: string } }} req - Authenticated request.
+ * @param {import("express").Response} res - Express response object.
+ * @returns {Promise<void>}
  */
 app.post("/api/notify/test", generalLimiter, requireAuth, async (req, res) => {
   const uid = req.user.uid;
@@ -286,7 +370,12 @@ app.post("/api/notify/test", generalLimiter, requireAuth, async (req, res) => {
   const results = { discord: null, email: null };
 
   /**
-   * Synthetic course payload used purely for smoke-testing notification output.
+   * Synthetic course object used only for test-notification delivery.
+   *
+   * It mimics the shape of a real NTUST course record closely enough for the
+   * Discord and email formatting helpers to render a realistic message.
+   *
+   * @type {Record<string, string | number>}
    */
   const fakeCourse = {
     CourseNo: "TEST0000",
@@ -327,10 +416,16 @@ app.post("/api/notify/test", generalLimiter, requireAuth, async (req, res) => {
 
 /**
  * GET /api/poll-options
- * Authorization: Bearer <firebase-id-token>
  *
- * Returns the polling interval options available to the caller. Unauthenticated
- * callers receive the regular user defaults.
+ * Returns the minimum allowed poll interval and the list of selectable poll
+ * intervals for the current caller.
+ *
+ * If the caller is not authenticated, or Firebase is unavailable, the route
+ * falls back to the standard non-privileged polling options.
+ *
+ * @param {import("express").Request} req - Express request object.
+ * @param {import("express").Response} res - Express response object.
+ * @returns {Promise<void>}
  */
 app.get("/api/poll-options", generalLimiter, async (req, res) => {
   const token = req.headers.authorization?.replace("Bearer ", "");
@@ -354,11 +449,16 @@ app.get("/api/poll-options", generalLimiter, async (req, res) => {
 
 /**
  * POST /api/courses
- * Authorization: Bearer <firebase-id-token>
- * Body: { Semester, CourseNo, CourseName, CourseTeacher }
  *
- * Proxies course search requests to the official NTUST API while applying this
- * service's timeout, validation, and rate limiting rules.
+ * Proxies a course search request to the official NTUST API.
+ *
+ * This route accepts a partial search payload from the client, fills in the
+ * remaining NTUST-specific fields expected by the upstream API, and returns the
+ * resulting array of courses.
+ *
+ * @param {import("express").Request} req - Express request object.
+ * @param {import("express").Response} res - Express response object.
+ * @returns {Promise<void>}
  */
 app.post("/api/courses", courseLimiter, requireAuth, async (req, res) => {
   const payload = {
@@ -401,10 +501,12 @@ app.post("/api/courses", courseLimiter, requireAuth, async (req, res) => {
 
 // ─── Notification helpers ─────────────────────────────────────────────────────
 /**
- * Determines whether a course is currently full according to its enrollment
- * limit and chosen student count.
+ * Determines whether a course is currently full.
  *
- * @param {{Restrict1: string | number, ChooseStudent: number}} course - Course record.
+ * A course is considered full only when Restrict1 is a valid positive number
+ * and the current ChooseStudent count is greater than or equal to that limit.
+ *
+ * @param {{Restrict1: string | number, ChooseStudent: number}} course - Course record returned by NTUST.
  * @returns {boolean}
  */
 function isFull(course) {
@@ -413,9 +515,12 @@ function isFull(course) {
 }
 
 /**
- * Calculates the number of remaining seats for a course.
+ * Calculates how many seats remain in a course.
  *
- * @param {{Restrict1: string | number, ChooseStudent: number}} course - Course record.
+ * If the course limit cannot be parsed as a number, the function returns "?"
+ * to signal that the remaining-seat count is unknown.
+ *
+ * @param {{Restrict1: string | number, ChooseStudent: number}} course - Course record returned by NTUST.
  * @returns {number | string}
  */
 function remainingSlots(course) {
@@ -424,14 +529,14 @@ function remainingSlots(course) {
 }
 
 /**
- * Maps NTUST schedule day codes to readable English day names.
+ * Maps NTUST weekday codes to human-readable English day abbreviations.
  *
  * @type {Record<string, string>}
  */
 const DAY_MAP = { M: "Mon", T: "Tue", W: "Wed", R: "Thu", F: "Fri", S: "Sat" };
 
 /**
- * Maps NTUST period codes to approximate start times.
+ * Maps NTUST period codes to display times.
  *
  * @type {Record<string, string>}
  */
@@ -454,10 +559,15 @@ const PERIOD_MAP = {
 };
 
 /**
- * Converts NTUST node strings such as "M1,W3" into a more readable schedule
- * string such as "Mon 08:10, Wed 10:10".
+ * Converts an NTUST schedule node string into a human-readable schedule.
  *
- * @param {string} node - Raw NTUST schedule string.
+ * Example:
+ * - Input: "M1,W3"
+ * - Output: "Mon 08:10, Wed 10:10"
+ *
+ * If no node string is provided, the function returns "N/A".
+ *
+ * @param {string} node - Raw schedule node string from NTUST.
  * @returns {string}
  */
 function formatNode(node) {
@@ -476,10 +586,13 @@ function formatNode(node) {
 }
 
 /**
- * Sends a Discord webhook notification announcing that a course has opened.
+ * Sends a Discord webhook notification for an open course slot.
  *
- * @param {Record<string, any>} course - Course data payload.
- * @param {{discordWebhook?: string, discordTagMe?: boolean, discordUserId?: string}} notify - User notification preferences.
+ * The message is formatted as a Discord embed and can optionally mention the
+ * user if their Discord ID and mention preference are configured.
+ *
+ * @param {Record<string, any>} course - Course data used to render the notification.
+ * @param {{discordWebhook?: string, discordTagMe?: boolean, discordUserId?: string}} notify - Notification preferences for the user.
  * @returns {Promise<void>}
  */
 async function sendDiscordNotification(course, notify) {
@@ -530,9 +643,12 @@ async function sendDiscordNotification(course, notify) {
 }
 
 /**
- * Sends an email notification announcing that a course has opened.
+ * Sends an email notification for an open course slot.
  *
- * @param {Record<string, any>} course - Course data payload.
+ * The function builds a small HTML email containing the key course details and
+ * a link back to the official NTUST course query page.
+ *
+ * @param {Record<string, any>} course - Course data used to render the email.
  * @param {string} toEmail - Recipient email address.
  * @returns {Promise<void>}
  */
@@ -576,38 +692,134 @@ async function sendEmailNotification(course, toEmail) {
 }
 
 // ─── Notification polling ─────────────────────────────────────────────────────
-// stateMap key: `uid::courseNo`
-// value: { wasFull: boolean, notifiedOpen: boolean }
-//   wasFull      – whether the course was full on the last poll.
-//   notifiedOpen – whether a notification has already been sent for the current
-//                  open window. This resets to false once the course becomes
-//                  full again, allowing one fresh alert the next time it opens.
+
+/**
+ * Per-user, per-course notification state.
+ *
+ * Key format:
+ * - `${uid}::${courseNo}`
+ *
+ * Value shape:
+ * - wasFull: whether the course was full on the previous successful poll.
+ * - notifiedOpen: whether an OPEN notification has already been sent for the
+ *   current open window.
+ *
+ * @type {Map<string, { wasFull: boolean, notifiedOpen: boolean }>}
+ */
 const stateMap = new Map();
 
-// Track when each user was last polled so per-user intervals are respected.
+/**
+ * Last time each user was polled.
+ *
+ * Key format:
+ * - uid
+ *
+ * Value:
+ * - Unix timestamp in milliseconds.
+ *
+ * @type {Map<string, number>}
+ */
 const userLastPolled = new Map();
 
-// Cache the last NTUST result per course key.
-// key: `semester::courseNo` → { course: object, fetchedAt: number }
+/**
+ * Cached NTUST course responses used to avoid redundant upstream requests.
+ *
+ * Key format:
+ * - `${semester}::${courseNo}`
+ *
+ * Value shape:
+ * - course: last fetched NTUST course object.
+ * - fetchedAt: Unix timestamp in milliseconds.
+ *
+ * @type {Map<string, { course: Record<string, any>, fetchedAt: number }>}
+ */
 const courseCache = new Map();
 
-// Track NTUST fetch health per course.
-// key: `semester::courseNo` → { lastSuccessAt, lastErrorAt, lastError, consecutiveFailures, totalFetches }
+/**
+ * Operational stats for each NTUST fetch target.
+ *
+ * This is mainly used for observability in the status route, so the client can
+ * understand recent fetch success/failure behavior.
+ *
+ * @type {Map<string, {
+ *   lastSuccessAt?: number | null,
+ *   lastErrorAt?: number | null,
+ *   lastError?: string | null,
+ *   consecutiveFailures: number,
+ *   totalFetches: number,
+ * }>} 
+ */
 const fetchStats = new Map();
 
+/**
+ * Whether the poller is still on its first initialization sweep.
+ *
+ * During the first run, state is seeded without sending alerts so users do not
+ * get spammed for courses that were already open before the backend started.
+ *
+ * @type {boolean}
+ */
 let isFirstNotifyRun = true;
+
+/**
+ * Guard flag that prevents overlapping poll cycles.
+ *
+ * @type {boolean}
+ */
 let pollRunning = false;
 
 // ─── In-memory Firestore mirror ───────────────────────────────────────────────
 // onSnapshot listeners keep these maps current in real time so the poll loop
 // can avoid repeated Firestore reads.
+
+/**
+ * Cached user records mirrored from Firestore.
+ *
+ * Key format:
+ * - uid
+ *
+ * Value shape:
+ * - email: user's email address.
+ * - notifyPrefs: notification preference object stored in Firestore.
+ *
+ * @type {Map<string, { email: string, notifyPrefs: Record<string, any> }>}
+ */
 const usersData = new Map();
+
+/**
+ * Cached watched-course records mirrored from each user's watchedCourses
+ * subcollection.
+ *
+ * Outer map key:
+ * - uid
+ *
+ * Inner map key:
+ * - courseNo
+ *
+ * @type {Map<string, Map<string, Record<string, any>>>}
+ */
 const watchedCoursesData = new Map();
+
+/**
+ * Active unsubscribe callbacks for watchedCourses snapshot listeners.
+ *
+ * Key format:
+ * - uid
+ *
+ * Value:
+ * - Firestore unsubscribe function.
+ *
+ * @type {Map<string, () => void>}
+ */
 const watchListeners = new Map();
 
 /**
- * Creates a real-time listener for a user's watchedCourses subcollection and
- * mirrors the latest documents into memory.
+ * Ensures that a real-time Firestore listener exists for a user's watched
+ * courses subcollection.
+ *
+ * When the snapshot updates, the backend rebuilds the user's in-memory course
+ * map so the poll loop can read current course preferences without performing
+ * Firestore queries every cycle.
  *
  * @param {string} uid - Firebase user ID.
  * @returns {void}
@@ -639,8 +851,10 @@ function setupWatchedCoursesListener(uid) {
 }
 
 /**
- * Attaches the top-level Firestore listener for users and dynamically manages
- * the watched-courses subcollection listeners for each active user.
+ * Sets up the top-level Firestore snapshot listener for the users collection.
+ *
+ * This listener keeps the in-memory user cache synchronized and creates or
+ * removes subcollection listeners as users appear, update, or are deleted.
  *
  * @returns {void}
  */
@@ -675,12 +889,19 @@ function setupFirestoreListeners() {
 }
 
 /**
- * Executes one notification polling cycle.
+ * Runs a single notification polling cycle.
  *
- * The poller builds a deduplicated course list from in-memory Firestore state,
- * fetches fresh or cached NTUST course data, detects FULL → OPEN transitions on
- * a per-user basis, and sends Discord/email notifications exactly once per open
- * window.
+ * High-level flow:
+ * 1. Read user and watched-course state from in-memory caches.
+ * 2. Build a deduplicated course map across all eligible subscribers.
+ * 3. Reuse fresh cached NTUST data or fetch live data when needed.
+ * 4. Detect FULL → OPEN transitions for each subscriber.
+ * 5. Send Discord/email notifications exactly once per open window.
+ *
+ * Important behavior:
+ * - No Firestore reads happen inside the poll loop.
+ * - Stale NTUST cache is never used to change notification state.
+ * - The first poll seeds state without sending alerts.
  *
  * @returns {Promise<void>}
  */
@@ -814,8 +1035,7 @@ async function pollNotifications() {
 
       if (!course) continue;
 
-      // If the fetch failed and we are using stale data, preserve the existing
-      // state rather than risk a missed FULL → OPEN transition.
+      // If stale data is being used, preserve the previous notification state.
       if (isStale) {
         console.log(
           `[NOTIFY] Skipping state update for ${entry.CourseNo} — using stale data`,
@@ -847,7 +1067,7 @@ async function pollNotifications() {
 
           stateMap.set(stateKey, { wasFull: false, notifiedOpen: true });
         } else if (nowFull) {
-          // Reset the open-window notification state once the course is full.
+          // Reset the notification flag so the next reopen triggers a new alert.
           stateMap.set(stateKey, { wasFull: true, notifiedOpen: false });
         } else {
           stateMap.set(stateKey, {
@@ -886,9 +1106,10 @@ app.listen(PORT, () => {
     setupFirestoreListeners();
 
     /**
-     * Schedules the next polling cycle only after the current cycle has fully
-     * completed. This avoids overlapping executions that could otherwise create
-     * duplicate work or inconsistent notification state.
+     * Schedules the next polling cycle after the current cycle has completed.
+     *
+     * Recursive setTimeout is used instead of setInterval so the backend never
+     * starts a new poll while the previous poll is still running.
      *
      * @returns {void}
      */
@@ -899,8 +1120,7 @@ app.listen(PORT, () => {
       }, 1_000);
     }
 
-    // Give the initial onSnapshot listeners a moment to populate memory before
-    // the first notification sweep starts.
+    // Give Firestore listeners a brief moment to warm up before the first poll.
     setTimeout(() => {
       pollNotifications().then(scheduleNextPoll);
     }, 2_000);
